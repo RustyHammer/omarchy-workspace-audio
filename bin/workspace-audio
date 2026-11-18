@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""workspace-audio: an app's sound is only heard on the workspace its window is on.
+
+  workspace-audio daemon          run the daemon (the bar widget starts it for you)
+  workspace-audio toggle          turn the whole thing on/off (with a notification)
+  workspace-audio on | off        same, without a notification
+  workspace-audio follow          focused app: audible everywhere <-> only on its workspace
+  workspace-audio global <class>  same, for a window class
+  workspace-audio status          print the current state
+
+Files:
+  ~/.config/workspace-audio/global-apps   window classes audible everywhere (one per line)
+  ~/.config/workspace-audio/disabled      present = turned off
+  $XDG_RUNTIME_DIR/workspace-audio.json   live status (read by the bar widget)
+"""
+import json, os, queue, signal, socket, subprocess, sys, threading, time
+
+CONF = os.path.expanduser("~/.config/workspace-audio")
+GLOBAL_FILE = os.path.join(CONF, "global-apps")
+DISABLED_FILE = os.path.join(CONF, "disabled")
+STATE_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                          "workspace-audio", "muted-apps")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+STATUS_FILE = os.path.join(RUNTIME, "workspace-audio.json")
+PIDFILE = os.path.join(RUNTIME, "workspace-audio.pid")
+DEFAULT_GLOBAL = ["spotify"]
+
+_FR = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").startswith("fr")
+_MSG = {
+    "app":       ("Workspace audio", "Son par bureau"),
+    "on_t":      ("🔈 Workspace audio: ON", "🔈 Son par bureau : ACTIVÉ"),
+    "on_b":      ("Each app is only heard on its workspace", "Chaque app ne s'entend que sur son bureau"),
+    "off_t":     ("🔊 Workspace audio: OFF", "🔊 Son par bureau : DÉSACTIVÉ"),
+    "off_b":     ("Everything is heard everywhere", "Tout s'entend partout"),
+    "local":     ("Only heard on its workspace", "Son limité à son bureau"),
+    "global":    ("Heard on every workspace", "Audible sur tous les bureaux"),
+    "nowin":     ("No focused window", "Aucune fenêtre active"),
+    "muted_b":   ("Muted outside workspace {ws}", "Son coupé hors du bureau {ws}"),
+    "keep":      ("Hear everywhere", "Entendre partout"),
+}
+
+
+def t(key, **kw):
+    return _MSG[key][1 if _FR else 0].format(**kw)
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+
+
+def notify(title, body="", *extra):
+    try:
+        subprocess.Popen(["notify-send", "-a", t("app"), "-t", "3000", *extra, title, body])
+    except OSError:
+        pass
+
+
+def load_global():
+    if not os.path.exists(GLOBAL_FILE):
+        os.makedirs(CONF, exist_ok=True)
+        with open(GLOBAL_FILE, "w") as f:
+            f.write("\n".join(DEFAULT_GLOBAL) + "\n")
+    with open(GLOBAL_FILE) as f:
+        return {l.strip().lower() for l in f if l.strip() and not l.startswith("#")}
+
+
+def save_global(apps):
+    os.makedirs(CONF, exist_ok=True)
+    with open(GLOBAL_FILE, "w") as f:
+        f.write("\n".join(sorted(apps)) + "\n")
+
+
+def disabled():
+    return os.path.exists(DISABLED_FILE)
+
+
+def daemon_pid():
+    """PID of the running daemon, or None."""
+    try:
+        pid = int(open(PIDFILE).read())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"workspace-audio" in f.read():
+                return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def ping_daemon():
+    pid = daemon_pid()
+    if pid:
+        os.kill(pid, signal.SIGUSR1)
+
+
+# ---------------------------------------------------------------- matching
+
+def ppid_map():
+    m = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                stat = open(f"/proc/{d}/stat").read()
+                m[int(d)] = int(stat.rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                pass
+    return m
+
+
+def comm(pid):
+    try:
+        return open(f"/proc/{pid}/comm").read().strip().lower()
+    except OSError:
+        return ""
+
+
+def windows_for(props, clients, ppids, comm=comm):
+    """Hyprland windows that own an audio stream."""
+    binary = (props.get("application.process.binary") or "").lower()
+    name = (props.get("application.name") or "").lower()
+    try:
+        pid = int(props.get("application.process.id", 0))
+    except ValueError:
+        pid = 0
+    by_pid = {}
+    for c in clients:
+        by_pid.setdefault(c["pid"], []).append(c)
+    # 1) walk up the process tree (browsers play audio from a child process).
+    #    Only when the PID really is the app's: sandboxes (firejail, bwrap with a
+    #    PID namespace) report a PID from inside their own namespace.
+    if pid and (not binary or binary[:15] == comm(pid)[:15]):
+        p, hops = pid, 0
+        while p > 1 and hops < 64:
+            if p in by_pid:
+                return by_pid[p]
+            p, hops = ppids.get(p, 0), hops + 1
+    # 2) fallback: binary / app name vs window class
+    cands = {x for x in (binary, name) if x}
+    hits = [c for c in clients if c["class"] in cands or c["iclass"] in cands]
+    if not hits:
+        hits = [c for c in clients for x in cands
+                if len(c["class"]) >= 4 and (c["class"] in x or x in c["class"])]
+    return hits
+
+
+def app_key(props):
+    return props.get("application.name") or props.get("application.process.binary") or ""
+
+
+def summarize(report):
+    """One entry per app (a browser may have several streams)."""
+    apps = {}
+    for e in report:
+        if e["name"] not in apps:
+            apps[e["name"]] = dict(e)
+        else:
+            a = apps[e["name"]]
+            a["muted"] = a["muted"] and e["muted"]
+            a["auto"] = a["auto"] or e["auto"]
+    return sorted(apps.values(), key=lambda e: e["name"].lower())
+
+
+# ---------------------------------------------------------------- daemon
+
+class Daemon:
+    def __init__(self):
+        self.events = queue.Queue()
+        self.muted_by_us = set()   # sink-input indexes we muted
+        self.overrides = set()     # streams the user unmuted by hand: leave them alone
+        self.notified = set()      # apps already notified this session
+        # Apps we muted, by name. WirePlumber restores mute per application.name
+        # and re-applies it when an app recreates its stream (Chrome does on
+        # every pause), so the new stream must still be recognised as ours.
+        self.muted_apps = self.load_state()
+        self._last_status = None
+
+    @staticmethod
+    def load_state():
+        try:
+            return {l.rstrip("\n") for l in open(STATE_FILE) if l.strip()}
+        except OSError:
+            return set()
+
+    def save_state(self):
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write("".join(a + "\n" for a in sorted(self.muted_apps)))
+
+    # --- event sources
+    def hypr_events(self):
+        path = f"{RUNTIME}/hypr/{os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '')}/.socket2.sock"
+        keys = ("workspace", "focusedmon", "movewindow", "openwindow", "closewindow",
+                "moveworkspace", "activespecial", "changefloatingmode")
+        while True:
+            try:
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(path)
+                for line in s.makefile():
+                    if line.split(">>", 1)[0].startswith(keys):
+                        self.events.put(1)
+            except OSError:
+                pass
+            time.sleep(1)
+
+    def pulse_events(self):
+        while True:
+            try:
+                p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+                for line in p.stdout:
+                    if "sink-input" in line:
+                        self.events.put(1)
+            except OSError:
+                pass
+            time.sleep(1)
+
+    # --- logic
+    def reconcile(self):
+        streams = json.loads(run("pactl", "-f", "json", "list", "sink-inputs") or "[]")
+        live = {s["index"] for s in streams}
+        self.muted_by_us &= live
+        self.overrides &= live
+
+        off = disabled()
+        mons = json.loads(run("hyprctl", "monitors", "-j") or "[]")
+        visible = {m["activeWorkspace"]["id"] for m in mons}
+        visible |= {m["specialWorkspace"]["id"] for m in mons if m["specialWorkspace"]["id"]}
+        clients = [{"pid": c["pid"], "class": c["class"].lower(),
+                    "iclass": c["initialClass"].lower(), "ws": c["workspace"]["id"]}
+                   for c in json.loads(run("hyprctl", "clients", "-j") or "[]")]
+        global_apps = load_global()
+        ppids = ppid_map()
+        report = []
+
+        for s in streams:
+            idx, muted = s["index"], s["mute"]
+            key = app_key(s["properties"])
+            wins = windows_for(s["properties"], clients, ppids)
+            classes = {c["class"] for c in wins} | {c["iclass"] for c in wins}
+            is_global = bool(classes & global_apps)
+            entry = {"name": key, "class": wins[0]["class"] if wins else "",
+                     "ws": wins[0]["ws"] if wins else None, "global": is_global}
+            report.append(entry)
+            if muted and key in self.muted_apps:   # recreated stream, inherited our mute
+                self.muted_by_us.add(idx)
+            ours = idx in self.muted_by_us
+            if ours and not muted:          # unmuted by hand: respect it
+                self.muted_by_us.discard(idx)
+                self.muted_apps.discard(key)
+                self.overrides.add(idx)
+            elif not ours and muted:        # muted by the user: not ours to touch
+                pass
+            else:
+                audible = (off or idx in self.overrides or not wins or is_global
+                           or any(c["ws"] in visible for c in wins))
+                if audible and ours:
+                    run("pactl", "set-sink-input-mute", str(idx), "0")
+                    self.muted_by_us.discard(idx)
+                    self.muted_apps.discard(key)
+                    muted = False
+                elif not audible and not ours:
+                    run("pactl", "set-sink-input-mute", str(idx), "1")
+                    self.muted_by_us.add(idx)
+                    self.muted_apps.add(key)
+                    muted = True
+                    self.offer_keep(wins[0]["class"], key, wins[0]["ws"])
+            entry["muted"] = muted
+            entry["auto"] = idx in self.muted_by_us
+        self.write_status(off, global_apps, report)
+
+    def write_status(self, off, global_apps, report):
+        data = json.dumps({"enabled": not off, "global": sorted(global_apps),
+                           "streams": summarize(report)}, ensure_ascii=False)
+        if data != self._last_status:
+            self._last_status = data
+            tmp = STATUS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(data)
+            os.replace(tmp, STATUS_FILE)
+
+    def offer_keep(self, cls, label, ws):
+        if cls in self.notified:
+            return
+        self.notified.add(cls)
+
+        def ask():
+            out = run("notify-send", "-a", t("app"), "-t", "6000", "-A", "keep=" + t("keep"),
+                      f"🔇 {label}", t("muted_b", ws=ws))
+            if out.strip() == "keep":
+                save_global(load_global() | {cls})
+                notify(f"🔊 {label}", t("global"))
+                self.events.put(1)
+        threading.Thread(target=ask, daemon=True).start()
+
+    def unmute_all(self):
+        for idx in list(self.muted_by_us):
+            run("pactl", "set-sink-input-mute", str(idx), "0")
+        self.muted_by_us.clear()
+        self.muted_apps.clear()
+        self.save_state()
+
+    def main(self):
+        if daemon_pid():
+            return                          # already running
+        with open(PIDFILE, "w") as f:
+            f.write(str(os.getpid()))
+        load_global()
+
+        def bye(*_):
+            self.unmute_all()
+            try:
+                os.remove(STATUS_FILE)
+            except OSError:
+                pass
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, bye)
+        signal.signal(signal.SIGINT, bye)
+        signal.signal(signal.SIGUSR1, lambda *_: self.events.put(1))
+        for target in (self.hypr_events, self.pulse_events):
+            threading.Thread(target=target, daemon=True).start()
+        self.events.put(1)                  # first pass right away
+        while True:
+            try:
+                self.events.get(timeout=10)
+                time.sleep(0.05)            # coalesce bursts of events
+                while not self.events.empty():
+                    self.events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                before = set(self.muted_apps)
+                self.reconcile()
+                if self.muted_apps != before:
+                    self.save_state()
+            except Exception as e:          # never die on an odd state
+                print("reconcile:", e, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- CLI
+
+def cmd_set(state, quiet=True):
+    if state == "on" and disabled():
+        os.remove(DISABLED_FILE)
+    elif state == "off" and not disabled():
+        os.makedirs(CONF, exist_ok=True)
+        open(DISABLED_FILE, "w").close()
+    if not quiet:
+        notify(t(state + "_t"), t(state + "_b"))
+    ping_daemon()
+
+
+def cmd_global(cls, label=None, quiet=True):
+    cls = cls.strip().lower()
+    if not cls:
+        return
+    apps = load_global()
+    adding = cls not in apps
+    apps.symmetric_difference_update({cls})
+    save_global(apps)
+    if not quiet:
+        notify(f"{'🔊' if adding else '🔈'} {label or cls}", t("global" if adding else "local"))
+    ping_daemon()
+
+
+def cmd_follow():
+    w = json.loads(run("hyprctl", "activewindow", "-j") or "{}")
+    if not w.get("class"):
+        notify(t("nowin"))
+        return
+    cmd_global(w["class"], label=w["class"], quiet=False)
+
+
+def cmd_status():
+    print("state:", "off" if disabled() else "on", "| daemon:", "running" if daemon_pid() else "stopped")
+    print("audible everywhere:", ", ".join(sorted(load_global())) or "-")
+
+
+if __name__ == "__main__":
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    {"daemon": lambda: Daemon().main(),
+     "toggle": lambda: cmd_set("on" if disabled() else "off", quiet=False),
+     "on": lambda: cmd_set("on"), "off": lambda: cmd_set("off"),
+     "follow": cmd_follow,
+     "global": lambda: cmd_global(sys.argv[2] if len(sys.argv) > 2 else ""),
+     "status": cmd_status}.get(arg, lambda: print(__doc__))()
