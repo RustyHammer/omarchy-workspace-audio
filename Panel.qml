@@ -76,7 +76,9 @@ Panel {
   }
 
   FileView {
-    path: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/workspace-audio.json"
+    // No shared fallback such as /tmp: the daemon refuses to run without a
+    // private runtime dir, so there is nothing to follow then.
+    path: Quickshell.env("XDG_RUNTIME_DIR") ? Quickshell.env("XDG_RUNTIME_DIR") + "/workspace-audio.json" : ""
     watchChanges: true
     printErrors: false
     onFileChanged: reload()

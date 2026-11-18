@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "rustyhammer.workspace-audio",
   "name": "Workspace audio",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "rustyhammer",
   "license": "MIT",
   "description": "Each app is only heard on the workspace its window is on. Keep music playing everywhere with one click.",

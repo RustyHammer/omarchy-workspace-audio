@@ -57,5 +57,68 @@ class Summarize(unittest.TestCase):
         self.assertTrue(out[1]["auto"])
 
 
+class SafeFiles(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        os.chmod(self.dir, 0o700)
+
+    def test_write_private_replaces_symlink_instead_of_following_it(self):
+        victim = os.path.join(self.dir, "victim")
+        with open(victim, "w") as f:
+            f.write("precious")
+        link = os.path.join(self.dir, "workspace-audio.json")
+        os.symlink(victim, link)
+        wa.write_private(link, "status")
+        with open(victim) as f:
+            self.assertEqual(f.read(), "precious")      # target untouched
+        self.assertFalse(os.path.islink(link))
+        with open(link) as f:
+            self.assertEqual(f.read(), "status")
+
+    def test_write_private_creates_owner_only_file(self):
+        path = os.path.join(self.dir, "sub", "file")
+        wa.write_private(path, "x")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_read_nofollow_rejects_symlink(self):
+        target = os.path.join(self.dir, "t")
+        open(target, "w").close()
+        link = os.path.join(self.dir, "l")
+        os.symlink(target, link)
+        with self.assertRaises(OSError):
+            wa.read_nofollow(link)
+
+
+class RuntimeDir(unittest.TestCase):
+    def _with_env(self, value):
+        from unittest import mock
+        env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        if value is not None:
+            env["XDG_RUNTIME_DIR"] = value
+        with mock.patch.dict(os.environ, env, clear=True):
+            return wa._private_runtime_dir()
+
+    def test_unset_has_no_fallback(self):
+        self.assertIsNone(self._with_env(None))
+
+    def test_shared_tmp_is_rejected(self):
+        self.assertIsNone(self._with_env("/tmp"))
+
+    def test_symlinked_dir_is_rejected(self):
+        import tempfile
+        real = tempfile.mkdtemp()
+        os.chmod(real, 0o700)
+        link = real + "-link"
+        os.symlink(real, link)
+        self.assertIsNone(self._with_env(link))
+
+    def test_private_dir_is_accepted(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o700)
+        self.assertEqual(self._with_env(d), d)
+
+
 if __name__ == "__main__":
     unittest.main()

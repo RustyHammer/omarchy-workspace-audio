@@ -12,6 +12,9 @@ Files:
   ~/.config/workspace-audio/global-apps   window classes audible everywhere (one per line)
   ~/.config/workspace-audio/disabled      present = turned off
   $XDG_RUNTIME_DIR/workspace-audio.json   live status (read by the bar widget)
+
+The daemon only runs when $XDG_RUNTIME_DIR is a private directory owned by the
+user, and never writes through symlinks.
 """
 import json, os, queue, signal, socket, subprocess, sys, threading, time
 
@@ -20,9 +23,31 @@ GLOBAL_FILE = os.path.join(CONF, "global-apps")
 DISABLED_FILE = os.path.join(CONF, "disabled")
 STATE_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
                           "workspace-audio", "muted-apps")
-RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
-STATUS_FILE = os.path.join(RUNTIME, "workspace-audio.json")
-PIDFILE = os.path.join(RUNTIME, "workspace-audio.pid")
+
+
+def _private_runtime_dir():
+    """$XDG_RUNTIME_DIR, only if it is a real directory private to this user.
+
+    Never falls back to a shared location such as /tmp: predictable names there
+    could be pre-created as symlinks by another user.
+    """
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    if not d or not os.path.isabs(d):
+        return None
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return None
+    import stat as _stat
+    if (not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+            or st.st_mode & (_stat.S_IWGRP | _stat.S_IWOTH)):
+        return None
+    return d
+
+
+RUNTIME = _private_runtime_dir()
+STATUS_FILE = os.path.join(RUNTIME, "workspace-audio.json") if RUNTIME else None
+PIDFILE = os.path.join(RUNTIME, "workspace-audio.pid") if RUNTIME else None
 DEFAULT_GLOBAL = ["spotify"]
 
 _FR = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").startswith("fr")
@@ -38,6 +63,33 @@ _MSG = {
     "muted_b":   ("Muted outside workspace {ws}", "Son coupé hors du bureau {ws}"),
     "keep":      ("Hear everywhere", "Entendre partout"),
 }
+
+
+def write_private(path, data):
+    """Atomically replace `path` with `data` without following symlinks.
+
+    The temp file is created exclusively with O_NOFOLLOW, and rename() replaces
+    a symlink at `path` instead of writing through it.
+    """
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_nofollow(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as f:
+        return f.read()
 
 
 def t(key, **kw):
@@ -59,18 +111,17 @@ def notify(title, body="", *extra):
 
 
 def load_global():
-    if not os.path.exists(GLOBAL_FILE):
-        os.makedirs(CONF, exist_ok=True)
-        with open(GLOBAL_FILE, "w") as f:
-            f.write("\n".join(DEFAULT_GLOBAL) + "\n")
-    with open(GLOBAL_FILE) as f:
-        return {l.strip().lower() for l in f if l.strip() and not l.startswith("#")}
+    if not os.path.lexists(GLOBAL_FILE):
+        write_private(GLOBAL_FILE, "\n".join(DEFAULT_GLOBAL) + "\n")
+    try:
+        text = read_nofollow(GLOBAL_FILE)
+    except OSError:
+        return set(DEFAULT_GLOBAL)
+    return {l.strip().lower() for l in text.splitlines() if l.strip() and not l.startswith("#")}
 
 
 def save_global(apps):
-    os.makedirs(CONF, exist_ok=True)
-    with open(GLOBAL_FILE, "w") as f:
-        f.write("\n".join(sorted(apps)) + "\n")
+    write_private(GLOBAL_FILE, "\n".join(sorted(apps)) + "\n")
 
 
 def disabled():
@@ -79,8 +130,10 @@ def disabled():
 
 def daemon_pid():
     """PID of the running daemon, or None."""
+    if not PIDFILE:
+        return None
     try:
-        pid = int(open(PIDFILE).read())
+        pid = int(read_nofollow(PIDFILE))
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             if b"workspace-audio" in f.read():
                 return pid
@@ -179,14 +232,12 @@ class Daemon:
     @staticmethod
     def load_state():
         try:
-            return {l.rstrip("\n") for l in open(STATE_FILE) if l.strip()}
+            return {l for l in read_nofollow(STATE_FILE).splitlines() if l.strip()}
         except OSError:
             return set()
 
     def save_state(self):
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            f.write("".join(a + "\n" for a in sorted(self.muted_apps)))
+        write_private(STATE_FILE, "".join(a + "\n" for a in sorted(self.muted_apps)))
 
     # --- event sources
     def hypr_events(self):
@@ -274,10 +325,7 @@ class Daemon:
                            "streams": summarize(report)}, ensure_ascii=False)
         if data != self._last_status:
             self._last_status = data
-            tmp = STATUS_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                f.write(data)
-            os.replace(tmp, STATUS_FILE)
+            write_private(STATUS_FILE, data)
 
     def offer_keep(self, cls, label, ws):
         if cls in self.notified:
@@ -301,10 +349,11 @@ class Daemon:
         self.save_state()
 
     def main(self):
+        if not RUNTIME:
+            sys.exit("workspace-audio: $XDG_RUNTIME_DIR is unset or not private; refusing to run")
         if daemon_pid():
             return                          # already running
-        with open(PIDFILE, "w") as f:
-            f.write(str(os.getpid()))
+        write_private(PIDFILE, str(os.getpid()))
         load_global()
 
         def bye(*_):
@@ -343,8 +392,7 @@ def cmd_set(state, quiet=True):
     if state == "on" and disabled():
         os.remove(DISABLED_FILE)
     elif state == "off" and not disabled():
-        os.makedirs(CONF, exist_ok=True)
-        open(DISABLED_FILE, "w").close()
+        write_private(DISABLED_FILE, "")
     if not quiet:
         notify(t(state + "_t"), t(state + "_b"))
     ping_daemon()
